@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="https://github.com/ldslds449/Cardbe/releases/latest">Download for Windows</a> ·
+  <a href="docs/linux-beta.md">Linux beta</a> ·
   <a href="docs/sharing-and-privacy.md">Privacy</a> ·
   <a href="docs/development.md">Build from source</a>
 </p>

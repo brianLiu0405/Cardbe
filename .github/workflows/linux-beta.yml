@@ -1,0 +1,64 @@
+name: Linux Beta
+
+on:
+  push:
+    branches: [linux/beta]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-beta:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARDBE_DEV_PORT: 1420
+      CARDBE_BUILD_COMMIT: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential curl wget file libssl-dev librsvg2-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev patchelf
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 12.8.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: cargo install wasm-tools --version 1.259.0 --locked
+      - run: pnpm install --frozen-lockfile
+      - name: Validate frontend and Rust
+        run: pnpm check
+      - name: Run frontend and Rust tests
+        run: pnpm test
+      - name: Build Debian beta
+        run: pnpm tauri build --bundles deb -- --locked
+      - name: Verify Debian package
+        run: |
+          set -euo pipefail
+          packages=(src-tauri/target/release/bundle/deb/*.deb)
+          test -f "${packages[0]}"
+          for package in "${packages[@]}"; do
+            dpkg-deb --info "$package"
+            dpkg-deb --contents "$package"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Cardbe-linux-beta-${{ github.sha }}
+          path: src-tauri/target/release/bundle/deb/*.deb
+          if-no-files-found: error
+          retention-days: 14

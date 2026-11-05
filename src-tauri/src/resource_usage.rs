@@ -424,10 +424,12 @@ mod platform {
 
         fn processes(&mut self, out: &mut Vec<ProcessEntry>) -> Result<(), String> {
             // Parent links and start times only; usage is refreshed per member.
+            // Linux tasks are threads sharing their process's memory and CPU
+            // accounting, so including them would count usage more than once.
             self.system.refresh_processes_specifics(
                 ProcessesToUpdate::All,
                 true,
-                ProcessRefreshKind::nothing(),
+                ProcessRefreshKind::nothing().without_tasks(),
             );
             out.clear();
             out.extend(
@@ -450,7 +452,10 @@ mod platform {
             self.system.refresh_processes_specifics(
                 ProcessesToUpdate::Some(&[pid]),
                 false,
-                ProcessRefreshKind::nothing().with_cpu().with_memory(),
+                ProcessRefreshKind::nothing()
+                    .without_tasks()
+                    .with_cpu()
+                    .with_memory(),
             );
             let process = self.system.process(pid)?;
             Some(ProcessStats {
@@ -458,6 +463,53 @@ mod platform {
                 cpu_time: Duration::from_millis(process.accumulated_cpu_time()),
                 memory_bytes: process.memory(),
             })
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod tests {
+        use super::*;
+        use std::sync::mpsc;
+
+        #[test]
+        fn excludes_native_threads_from_process_snapshots() {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
+            let worker = std::thread::spawn(move || {
+                let thread_path = std::fs::read_link("/proc/thread-self").unwrap();
+                let tid: u32 = thread_path
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                ready_tx.send(tid).unwrap();
+                // Dropping the sender also releases the worker if the test fails.
+                let _ = stop_rx.recv();
+            });
+            let tid = ready_rx.recv().unwrap();
+            let mut source = SystemProcesses::new();
+            let mut entries = Vec::new();
+            let listed = source.processes(&mut entries);
+            let listed_thread = entries.iter().any(|entry| entry.pid == tid);
+            let root_stats = source.read(std::process::id());
+            // The per-member refresh must not reintroduce threads after listing.
+            let refreshed_thread = source.system.process(Pid::from_u32(tid)).is_some();
+            drop(stop_tx);
+            worker.join().unwrap();
+
+            listed.unwrap();
+            assert_ne!(tid, std::process::id());
+            assert!(root_stats.unwrap().memory_bytes > 0);
+            assert!(
+                !listed_thread,
+                "native thread {tid} was listed as a process"
+            );
+            assert!(
+                !refreshed_thread,
+                "refreshing process usage added native thread {tid}"
+            );
         }
     }
 }
