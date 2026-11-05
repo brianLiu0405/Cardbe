@@ -344,6 +344,8 @@ pub fn read_with_archives_for_board<R>(
 pub fn update_stored_with_pre_import_snapshot_for_board<R>(
     state: &State<'_, SharedAppData>,
     expected_board_id: i64,
+    flow: Option<&crate::flow::FlowData>,
+    notes: &[crate::models::Note],
     change: impl FnOnce(&mut StoredData) -> Result<R, DomainError>,
 ) -> Result<(R, PathBuf), DomainError> {
     let mut guard = lock_app(state)?;
@@ -353,17 +355,56 @@ pub fn update_stored_with_pre_import_snapshot_for_board<R>(
     ensure_board_can_edit(&guard)?;
     ensure_archives_loaded_locked(&mut guard)?;
     let snapshot_path = write_pre_import_snapshot(&guard)?;
-    // Imported tasks receive new ids, so earlier events no longer apply.
-    let result =
-        update_locked_with_events(&mut guard, EventWrite::Reset(EventSource::local()), change)?;
+    let result = import_locked(&mut guard, flow, notes, change)?;
     Ok((result, snapshot_path))
 }
 
 fn write_pre_import_snapshot(guard: &AppData) -> Result<PathBuf, String> {
     let snapshot_path = guard.database.path().with_file_name("data.pre-import.json");
-    storage::write_document(&snapshot_path, &guard.stored)
+    let backup = guard
+        .database
+        .read_single_board_backup(guard.active_board_id)
+        .map_err(|error| error.to_string())?;
+    // Keep the original StoredData fields for legacy recovery readers, adding
+    // the portable Flow/notes fields understood by single-board import.
+    let mut snapshot = serde_json::to_value(&guard.stored).map_err(|error| error.to_string())?;
+    snapshot["flow"] = serde_json::to_value(backup.flow).map_err(|error| error.to_string())?;
+    snapshot["notes"] = serde_json::to_value(backup.notes).map_err(|error| error.to_string())?;
+    storage::write_document(&snapshot_path, &snapshot)
         .map_err(|error| format!("Could not create pre-import backup: {error}"))?;
     Ok(snapshot_path)
+}
+
+fn import_locked<R>(
+    guard: &mut AppData,
+    flow: Option<&crate::flow::FlowData>,
+    notes: &[crate::models::Note],
+    change: impl FnOnce(&mut StoredData) -> Result<R, DomainError>,
+) -> Result<R, DomainError> {
+    let mut candidate = guard.stored.clone();
+    let result = change(&mut candidate)?;
+    let now = crate::commands::archive::current_time_millis()?;
+    crate::completion::reconcile(&guard.stored, &mut candidate, now)?;
+    candidate.keep_pinned_tasks_first();
+    let board_changed = candidate.columns != guard.stored.columns
+        || candidate.archives != guard.stored.archives
+        || candidate.templates != guard.stored.templates;
+    let stats = guard
+        .database
+        .import_board_data(&guard.stored, &candidate, flow, notes)
+        .map_err(DomainError::repository)?;
+    let previous = std::mem::replace(&mut guard.stored, candidate);
+    refresh_active_board_summary(guard)?;
+    if flow.is_some() {
+        // Task-only Undo cannot restore canvases or global notes. The complete
+        // pre-import file is the recovery point for a portable board import.
+        guard.undo_history.clear();
+        guard.redo_history.clear();
+    } else if board_changed {
+        guard.record_board_undo(previous, stats.event_op);
+    }
+    guard.refresh_labels();
+    Ok(result)
 }
 
 fn update_locked<R>(
@@ -794,6 +835,17 @@ mod tests {
             tasks: Vec::new(),
         });
         let mut app = app_data(&dir, stored);
+        let note = app
+            .database
+            .create_note_with_content(123, "備註".into(), "必須保留".into())
+            .unwrap();
+        let layout: crate::flow::FlowLayout = serde_json::from_value(serde_json::json!({
+            "nodes": [], "viewport": {"x": 12, "y": 24, "zoom": 2},
+            "annotations": [{"id": "note", "kind": "note", "note_id": note.id, "x": 0, "y": 0, "width": 240}]
+        })).unwrap();
+        app.database
+            .save_flow_layout(app.active_board_id, crate::flow::DEFAULT_TAB_ID, &layout)
+            .unwrap();
         let snapshot_path = write_pre_import_snapshot(&app).unwrap();
 
         update_locked(&mut app, |data| {
@@ -807,9 +859,71 @@ mod tests {
         })
         .unwrap();
 
-        let snapshot: StoredData =
-            serde_json::from_str(&fs::read_to_string(snapshot_path).unwrap()).unwrap();
+        let json = fs::read_to_string(snapshot_path).unwrap();
+        let snapshot: StoredData = serde_json::from_str(&json).unwrap();
         assert_eq!(snapshot.columns[0].name, "Before import");
+        let portable: crate::models::SingleBoardExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(portable.flow.unwrap().layout, layout);
+        assert_eq!(portable.notes, vec![note]);
+        drop(app);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn single_board_flow_import_commits_memory_and_clears_task_only_undo_on_success() {
+        let dir = std::env::temp_dir().join(format!(
+            "cardbe-flow-import-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let mut app = app_data(&dir, StoredData::default());
+        update_locked(&mut app, |data| {
+            data.columns.push(Column {
+                id: 1,
+                name: "Before".into(),
+                color: String::new(),
+                sort_order: Default::default(),
+                sort_rules: vec![],
+                done: false,
+                tasks: vec![],
+            });
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.undo_history.len(), 1);
+        let before = app.stored.clone();
+        let flow = crate::flow::FlowData::default();
+        app.database.connection.execute_batch("CREATE TRIGGER fail_import BEFORE INSERT ON cardbe_flow_layouts BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+        assert!(import_locked(&mut app, Some(&flow), &[], |data| {
+            data.columns[0].name = "Rejected".into();
+            Ok(())
+        })
+        .is_err());
+        assert_eq!(app.stored, before);
+        assert_eq!(app.undo_history.len(), 1);
+        app.database
+            .connection
+            .execute_batch("DROP TRIGGER fail_import;")
+            .unwrap();
+        import_locked(&mut app, Some(&flow), &[], |data| {
+            data.columns[0].name = "Imported".into();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.stored.columns[0].name, "Imported");
+        assert!(app.undo_history.is_empty());
+        assert!(app.redo_history.is_empty());
+        // Legacy task-only imports preserve their established Undo behavior.
+        import_locked(&mut app, None, &[], |data| {
+            data.columns[0].name = "Legacy import".into();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(app.undo_history.len(), 1);
         drop(app);
         fs::remove_dir_all(dir).unwrap();
     }

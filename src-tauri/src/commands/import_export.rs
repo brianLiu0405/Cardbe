@@ -1,7 +1,8 @@
 use crate::errors::CommandError;
 use crate::{
     models::{
-        AllBoardsExport, AllBoardsExportBoard, ExportData, StoredData, CURRENT_SCHEMA_VERSION,
+        AllBoardsExport, AllBoardsExportBoard, ExportData, SingleBoardExport, StoredData,
+        CURRENT_SCHEMA_VERSION,
     },
     state::{
         lock_app, read_with_archives_for_board, update_stored_with_pre_import_snapshot_for_board,
@@ -15,14 +16,37 @@ pub fn export_data(
     state: State<'_, SharedAppData>,
     expected_board_id: i64,
 ) -> Result<String, CommandError> {
-    let export = read_with_archives_for_board(&state, expected_board_id, |guard| ExportData {
-        columns: guard.stored.columns.clone(),
-        archives: guard.stored.archives.clone(),
-        templates: guard.stored.templates.clone(),
-        labels: guard.labels.iter().cloned().collect(),
-        label_recency: guard.stored.label_recency.clone(),
-    })?;
+    let export = read_with_archives_for_board(&state, expected_board_id, |guard| {
+        guard.database.read_single_board_backup(expected_board_id)
+    })?
+    .map_err(CommandError::repository)?;
     serde_json::to_string(&export).map_err(CommandError::internal)
+}
+
+fn parse_single_board_backup(json_data: &str) -> Result<SingleBoardExport, CommandError> {
+    let backup: SingleBoardExport =
+        serde_json::from_str(json_data).map_err(|_| CommandError::InvalidImport)?;
+    if let Some(flow) = &backup.flow {
+        // Legacy task-only imports can repair IDs. A canvas refers to those
+        // IDs, so ambiguous or missing identities cannot be repaired safely.
+        let mut task_ids = std::collections::HashSet::new();
+        if backup
+            .data
+            .columns
+            .iter()
+            .flat_map(|column| &column.tasks)
+            .chain(backup.data.archives.iter().map(|archive| &archive.task))
+            .any(|task| task.id < 0 || !task_ids.insert(task.id))
+        {
+            return Err(CommandError::InvalidImport);
+        }
+        crate::flow::validate_data(flow, &backup.data).map_err(|_| CommandError::InvalidImport)?;
+        crate::storage::validate_single_board_notes(flow, &backup.notes)
+            .map_err(|_| CommandError::InvalidImport)?;
+    } else if !backup.notes.is_empty() {
+        return Err(CommandError::InvalidImport);
+    }
+    Ok(backup)
 }
 
 #[tauri::command]
@@ -192,11 +216,15 @@ pub fn import_data(
     json_data: String,
     expected_board_id: i64,
 ) -> Result<String, CommandError> {
-    let import: ExportData =
-        serde_json::from_str(&json_data).map_err(|_| CommandError::InvalidImport)?;
+    let backup = parse_single_board_backup(&json_data)?;
+    let import = backup.data;
 
-    let (_, snapshot_path) =
-        update_stored_with_pre_import_snapshot_for_board(&state, expected_board_id, |data| {
+    let (_, snapshot_path) = update_stored_with_pre_import_snapshot_for_board(
+        &state,
+        expected_board_id,
+        backup.flow.as_ref(),
+        &backup.notes,
+        |data| {
             data.columns = import.columns;
             data.archives = import.archives;
             data.templates = import.templates;
@@ -208,7 +236,8 @@ pub fn import_data(
             data.repair_task_ids();
             data.repair_template_ids();
             Ok(())
-        })?;
+        },
+    )?;
 
     Ok(snapshot_path.display().to_string())
 }
@@ -219,8 +248,8 @@ pub fn import_board_as_new(
     json_data: String,
     name: String,
 ) -> Result<crate::models::Board, CommandError> {
-    let import: ExportData =
-        serde_json::from_str(&json_data).map_err(|_| CommandError::InvalidImport)?;
+    let backup = parse_single_board_backup(&json_data)?;
+    let import = backup.data;
     let name = super::boards::board_name(name).map_err(|_| CommandError::BoardNameInvalid)?;
     let mut data = StoredData {
         columns: import.columns,
@@ -237,7 +266,7 @@ pub fn import_board_as_new(
     let mut guard = lock_app(&state)?;
     let board = guard
         .database
-        .create_board_with_data(&name, &data)
+        .create_board_with_backup(&name, &data, backup.flow.as_ref(), &backup.notes)
         .map_err(CommandError::repository)?;
     guard.boards.push(board.clone());
     guard
@@ -249,6 +278,63 @@ pub fn import_board_as_new(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_board_backup_accepts_legacy_fields_and_keeps_preview_shape() {
+        let legacy = r#"{"columns":[],"archives":[],"labels":["工作"]}"#;
+        let mut backup = parse_single_board_backup(legacy).unwrap();
+        assert!(backup.flow.is_none());
+        assert!(backup.notes.is_empty());
+        backup.flow = Some(Default::default());
+        let json = serde_json::to_value(&backup).unwrap();
+        assert!(json["columns"].is_array());
+        assert!(json["archives"].is_array());
+        assert!(json.get("data").is_none());
+        assert!(parse_single_board_backup(&json.to_string())
+            .unwrap()
+            .flow
+            .is_some());
+        // Existing readers continue to see the board fields.
+        assert_eq!(
+            serde_json::from_value::<ExportData>(json).unwrap().labels,
+            vec!["工作"]
+        );
+    }
+
+    #[test]
+    fn single_board_backup_rejects_invalid_flow_and_unrelated_notes() {
+        let mut json = serde_json::json!({
+            "columns": [], "archives": [],
+            "flow": {"layout": {"nodes": [{"task_id": 99, "x": 0, "y": 0}], "viewport": null}, "relationships": []}
+        });
+        assert!(matches!(
+            parse_single_board_backup(&json.to_string()),
+            Err(CommandError::InvalidImport)
+        ));
+        json["flow"]["layout"]["nodes"] = serde_json::json!([]);
+        let note = serde_json::json!({"id": 1, "title": "Private", "content": "", "pinned": false, "created_at": 0, "updated_at": 0});
+        json["notes"] = serde_json::json!([note]);
+        assert!(parse_single_board_backup(&json.to_string()).is_err());
+        json["flow"]["layout"]["annotations"] = serde_json::json!([{"id": "note", "x": 0, "y": 0, "width": 240, "kind": "note", "note_id": 1}]);
+        assert!(parse_single_board_backup(&json.to_string()).is_ok());
+        json["notes"] = serde_json::json!([note, note]);
+        assert!(parse_single_board_backup(&json.to_string()).is_err());
+        json.as_object_mut().unwrap().remove("flow");
+        assert!(parse_single_board_backup(&json.to_string()).is_err());
+    }
+
+    #[test]
+    fn single_board_flow_import_rejects_ambiguous_task_ids_but_legacy_can_repair_them() {
+        let mut json = serde_json::json!({
+            "columns": [{"tasks": [{"id": 1}, {"id": 1}]}], "archives": [],
+            "flow": {"layout": {"nodes": [], "viewport": null}, "relationships": []}
+        });
+        assert!(parse_single_board_backup(&json.to_string()).is_err());
+        json["columns"][0]["tasks"][1]["id"] = (-1).into();
+        assert!(parse_single_board_backup(&json.to_string()).is_err());
+        json.as_object_mut().unwrap().remove("flow");
+        assert!(parse_single_board_backup(&json.to_string()).is_ok());
+    }
 
     fn backup(name: &str) -> String {
         serde_json::to_string(&AllBoardsExport {

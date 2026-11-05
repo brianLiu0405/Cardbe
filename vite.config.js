@@ -81,6 +81,14 @@ export default defineConfig({
     port,
     strictPort: true,
     host: host || "127.0.0.1",
+    // The prototype console uses same-origin requests; its service stays on loopback.
+    proxy: {
+      "/enterprise-api": {
+        target: "http://127.0.0.1:9040",
+        changeOrigin: true,
+        rewrite: (requestPath) => requestPath.replace(/^\/enterprise-api/, ""),
+      },
+    },
     // Let the HMR client use the origin serving /@vite/client, including the
     // LAN share proxy. HTTP and WebSocket use the same upstream port.
     hmr: { timeout: 30000 },
@@ -90,6 +98,10 @@ export default defineConfig({
         const normalizedPath = filePath.replaceAll("\\", "/");
         return (
           normalizedPath.includes("/src-tauri/") ||
+          normalizedPath.startsWith(
+            `${projectRoot}/enterprise-server/target/`,
+          ) ||
+          normalizedPath.startsWith(`${projectRoot}/enterprise-server/data/`) ||
           normalizedPath.startsWith(`${projectRoot}/.cardbe-debug/`) ||
           normalizedPath.startsWith(`${projectRoot}/build/`) ||
           (isCustomPort && normalizedPath.includes("/.svelte-kit/")) ||

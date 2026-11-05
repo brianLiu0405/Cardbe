@@ -66,6 +66,7 @@ it("waits for queued saves before loading another tab", async () => {
     let saving = true, disposed = false, loaded = true, tab_id = "a", requested_tab = "";
     let pending_layout = { nodes: [] }, idle_waiters = [];
     const flush_viewport_save = () => {};
+    const import_blocked = () => false;
     const data = { layout: { connections: {} } };
     function save_layout(layout) {
       save(layout, tab_id);
@@ -133,6 +134,7 @@ it("saves the viewport once after panning settles", () => {
       const viewport_save_delay = 800;
       const data = { layout: { viewport: { x: 0, y: 0, zoom: 1 } } };
       const save_positions = save;
+      const import_blocked = () => false;
       ${extract(["schedule_viewport_save", "flush_viewport_save"])}
       return {
         schedule_viewport_save,

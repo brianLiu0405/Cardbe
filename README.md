@@ -1,3 +1,5 @@
+> **企業版開發副本**：新增獨立的本機企業基礎原型，包含成員、板級權限、任務討論與稽核。請先閱讀[啟動方式](enterprise-server/README.md)與[實作進度及限制](docs/enterprise-progress.md)；完整目標見[企業版計畫](docs/enterprise-plan.md)。
+
 <p align="center">
   <img src="app_icon.png" alt="Cardbe" width="128" height="128">
 </p>

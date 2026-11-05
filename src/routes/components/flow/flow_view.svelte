@@ -33,6 +33,7 @@
   import * as Dialog from "#lib/components/ui/dialog/index.js";
   import * as AlertDialog from "#lib/components/ui/alert-dialog/index.js";
   import FlowTabs from "./flow_tabs.svelte";
+  import { flow_imports } from "./import-coordinator";
   import { Separator } from "#lib/components/ui/separator/index.js";
   import * as Field from "#lib/components/ui/field/index.js";
   import * as Empty from "#lib/components/ui/empty/index.js";
@@ -88,7 +89,7 @@
     onArchiveTask,
     onDeleteTask,
     search_task_ids = null,
-    read_only = false,
+    read_only: board_read_only = false,
     onViewTask,
     onEditTask,
   }: {
@@ -106,6 +107,14 @@
     onViewTask: (task: Task) => void;
     onEditTask: (task: Task) => void;
   } = $props();
+  let import_paused = $state(false);
+  const read_only = $derived(board_read_only || import_paused);
+  function import_blocked() {
+    return import_paused || flow_imports.is_blocked(board_id);
+  }
+  function write_flow<T>(action: () => Promise<T>) {
+    return flow_imports.write(board_id, action);
+  }
   const nodeTypes = {
     task: TaskNodeComponent,
     annotation: AnnotationNodeComponent,
@@ -214,7 +223,10 @@
   const selected_notes = $derived(
     unplaced_notes.filter((note) => selected_note_ids.includes(note.id)),
   );
-  async function refresh_notes() {
+  async function refresh_notes(after_import = false) {
+    if (disposed || (import_blocked() && !after_import)) {
+      return;
+    }
     const request = ++notes_request;
     notes_loading = true;
     notes_error = null;
@@ -323,16 +335,25 @@
   let idle_waiters: (() => void)[] = [];
   function finish_saving() {
     saving = false;
+    if (import_blocked()) {
+      pending_layout = null;
+    }
     if (pending_layout) {
       const next = { ...pending_layout, connections: data.layout.connections };
       pending_layout = null;
       if (disposed) {
         // The view closed while saving; still persist the last queued layout.
-        void invoke("save_flow_layout", {
-          expectedBoardId: board_id,
-          tabId: tab_id,
-          layout: next,
-        }).catch((error) => toast.error(translateCommandError(error)));
+        void write_flow(() =>
+          invoke("save_flow_layout", {
+            expectedBoardId: board_id,
+            tabId: tab_id,
+            layout: next,
+          }),
+        ).catch((error) => {
+          if (!import_blocked()) {
+            toast.error(translateCommandError(error));
+          }
+        });
       } else {
         void save_layout(next);
       }
@@ -438,8 +459,9 @@
   });
   async function refresh_archives(
     ids = missing_archive_task_ids(data.layout, columns),
+    after_import = false,
   ) {
-    if (disposed) {
+    if (disposed || (import_blocked() && !after_import)) {
       return;
     }
     const request = ++archive_request;
@@ -534,7 +556,10 @@
     ).map((edge) => ({ ...edge, selected: selected_edges.includes(edge.id) }));
   });
 
-  async function load(next = tab_id) {
+  async function load(next = tab_id, after_import = false) {
+    if (disposed || (import_blocked() && !after_import)) {
+      return;
+    }
     const request = ++load_request;
     clearTimeout(viewport_timer);
     viewport_timer = undefined;
@@ -567,25 +592,35 @@
   }
   // `tab_id` changes only after loading, so queued saves keep their original tab.
   async function switch_tab(id: string) {
+    if (import_blocked()) {
+      return;
+    }
     requested_tab = id;
     if (id === tab_id && loaded) {
       return;
     }
     flush_viewport_save();
     await wait_idle();
-    if (!disposed && id === requested_tab) {
+    if (!disposed && !import_blocked() && id === requested_tab) {
       await load(id);
     }
   }
   async function change_tabs(request: () => Promise<FlowTab[]>) {
-    if (read_only || tab_busy) {
+    if (read_only || tab_busy || import_blocked()) {
       return false;
     }
     tab_busy = true;
     try {
-      tabs = await request();
+      const result = await request();
+      if (disposed || import_blocked()) {
+        return false;
+      }
+      tabs = result;
       return true;
     } catch (error) {
+      if (disposed || import_blocked()) {
+        return false;
+      }
       toast.error(translateCommandError(error));
       if (parseCommandError(error)?.code === "FLOW_TAB_NOT_FOUND") {
         void switch_tab("");
@@ -600,11 +635,13 @@
     const name = m.flow_tab_new_name({ number: formatNumber(tabs.length + 1) });
     if (
       await change_tabs(() =>
-        invoke<FlowTab[]>("create_flow_tab", {
-          expectedBoardId: board_id,
-          tabId: id,
-          name,
-        }),
+        write_flow(() =>
+          invoke<FlowTab[]>("create_flow_tab", {
+            expectedBoardId: board_id,
+            tabId: id,
+            name,
+          }),
+        ),
       )
     ) {
       await switch_tab(id);
@@ -618,11 +655,13 @@
       return true;
     }
     return change_tabs(() =>
-      invoke<FlowTab[]>("rename_flow_tab", {
-        expectedBoardId: board_id,
-        tabId: id,
-        name,
-      }),
+      write_flow(() =>
+        invoke<FlowTab[]>("rename_flow_tab", {
+          expectedBoardId: board_id,
+          tabId: id,
+          name,
+        }),
+      ),
     );
   }
   // Show the new order immediately so dropped tabs do not snap back while saving.
@@ -634,10 +673,12 @@
     tabs = ids.flatMap((id) => previous.filter((tab) => tab.id === id));
     if (
       !(await change_tabs(() =>
-        invoke<FlowTab[]>("reorder_flow_tabs", {
-          expectedBoardId: board_id,
-          tabIds: ids,
-        }),
+        write_flow(() =>
+          invoke<FlowTab[]>("reorder_flow_tabs", {
+            expectedBoardId: board_id,
+            tabIds: ids,
+          }),
+        ),
       ))
     ) {
       tabs = previous;
@@ -661,17 +702,63 @@
     }
     if (
       (await change_tabs(() =>
-        invoke<FlowTab[]>("delete_flow_tab", {
-          expectedBoardId: board_id,
-          tabId: id,
-        }),
+        write_flow(() =>
+          invoke<FlowTab[]>("delete_flow_tab", {
+            expectedBoardId: board_id,
+            tabId: id,
+          }),
+        ),
       )) &&
       id === tab_id
     ) {
       await switch_tab(next);
     }
   }
+  function pause_import() {
+    import_paused = true;
+    clearTimeout(viewport_timer);
+    viewport_timer = undefined;
+    pending_layout = null;
+    load_request++;
+    notes_request++;
+    archive_request++;
+    requested_tab = "";
+    loaded = false;
+    canvas_ready = false;
+    data = {
+      tab_id: "",
+      layout: { nodes: [], viewport: null },
+      relationships: [],
+      tabs: [],
+    };
+    tabs = [];
+    nodes = [];
+    edges = [];
+    notes = [];
+    canvas_archives = [];
+    selected_edges = [];
+    editing_annotation_id = null;
+    add_open = false;
+    note_picker_open = false;
+    renaming_tab_id = null;
+    deleting_tab = null;
+  }
   onMount(() => {
+    const unregister = flow_imports.register(board_id, {
+      pause: pause_import,
+      reload: async () => {
+        if (disposed) {
+          return;
+        }
+        await Promise.all([load("", true), refresh_notes(true)]);
+        if (!disposed && loaded) {
+          await refresh_archives(undefined, true);
+        }
+      },
+      resume: () => {
+        import_paused = false;
+      },
+    });
     void load();
     const on_focus = () => void refresh_notes();
     window.addEventListener("focus", on_focus);
@@ -688,6 +775,7 @@
       void listener.then((unlisten) => unlisten());
       flush_viewport_save();
       disposed = true;
+      unregister();
     };
   });
 
@@ -696,6 +784,10 @@
   let viewport_timer: ReturnType<typeof setTimeout> | undefined;
   function schedule_viewport_save() {
     clearTimeout(viewport_timer);
+    if (import_blocked()) {
+      viewport_timer = undefined;
+      return;
+    }
     viewport_timer = setTimeout(flush_viewport_save, viewport_save_delay);
   }
   function flush_viewport_save() {
@@ -704,6 +796,9 @@
     }
     clearTimeout(viewport_timer);
     viewport_timer = undefined;
+    if (import_blocked()) {
+      return;
+    }
     const saved = data.layout.viewport;
     if (
       saved?.x !== viewport.x ||
@@ -717,7 +812,7 @@
     // Every layout save carries the current viewport.
     clearTimeout(viewport_timer);
     viewport_timer = undefined;
-    if (read_only || !loaded || disposed) {
+    if (read_only || !loaded || disposed || import_blocked()) {
       return false;
     }
     if (saving) {
@@ -727,17 +822,22 @@
     data = { ...data, layout };
     saving = true;
     try {
-      await invoke("save_flow_layout", {
-        expectedBoardId: board_id,
-        tabId: tab_id,
-        layout,
-      });
-      if (!disposed) {
+      await write_flow(() =>
+        invoke("save_flow_layout", {
+          expectedBoardId: board_id,
+          tabId: tab_id,
+          layout,
+        }),
+      );
+      if (!disposed && !import_blocked()) {
         data = { ...data, layout };
       }
-      return !disposed;
+      return !disposed && !import_blocked();
     } catch (error) {
       pending_layout = null;
+      if (import_blocked()) {
+        return false;
+      }
       toast.error(translateCommandError(error));
       if (!disposed) {
         await load();
@@ -819,9 +919,8 @@
     }
     saving = true;
     try {
-      const relationship = await invoke<Relationship>(
-        "create_task_relationship",
-        {
+      const relationship = await write_flow(() =>
+        invoke<Relationship>("create_task_relationship", {
           expectedBoardId: board_id,
           relationship: {
             source: get_task_id(connection.source),
@@ -830,9 +929,9 @@
             source_arrow: false,
             target_arrow: true,
           },
-        },
+        }),
       );
-      if (!disposed) {
+      if (!disposed && !import_blocked()) {
         data = {
           ...data,
           relationships: [...data.relationships, relationship],
@@ -846,6 +945,9 @@
         pending_layout = layout;
       }
     } catch (error) {
+      if (import_blocked()) {
+        return;
+      }
       toast.error(translateCommandError(error));
     } finally {
       finish_saving();
@@ -860,11 +962,13 @@
     }
     saving = true;
     try {
-      const saved = await invoke<Relationship>("change_task_relationship", {
-        expectedBoardId: board_id,
-        relationship: { ...current, ...arrows },
-      });
-      if (!disposed) {
+      const saved = await write_flow(() =>
+        invoke<Relationship>("change_task_relationship", {
+          expectedBoardId: board_id,
+          relationship: { ...current, ...arrows },
+        }),
+      );
+      if (!disposed && !import_blocked()) {
         data = {
           ...data,
           relationships: data.relationships.map((edge) =>
@@ -874,6 +978,9 @@
         };
       }
     } catch (error) {
+      if (import_blocked()) {
+        return;
+      }
       toast.error(translateCommandError(error));
       if (
         !disposed &&
@@ -892,16 +999,21 @@
     saving = true;
     try {
       for (const id of ids) {
+        if (import_blocked()) {
+          return;
+        }
         const relationship = edges.find((edge) => edge.id === id)?.data
           ?.relationship;
         if (!relationship) {
           continue;
         }
-        await invoke("remove_task_relationship", {
-          expectedBoardId: board_id,
-          relationship,
-        });
-        if (!disposed) {
+        await write_flow(() =>
+          invoke("remove_task_relationship", {
+            expectedBoardId: board_id,
+            relationship,
+          }),
+        );
+        if (!disposed && !import_blocked()) {
           data = {
             ...data,
             layout: {
@@ -920,6 +1032,9 @@
       }
       selected_edges = [];
     } catch (error) {
+      if (import_blocked()) {
+        return;
+      }
       toast.error(translateCommandError(error));
       if (!disposed) {
         await load();
@@ -989,7 +1104,7 @@
         active_id={tab_id}
         panel_id="flow-tab-panel"
         {read_only}
-        busy={tab_busy}
+        busy={tab_busy || import_paused}
         bind:renaming_id={renaming_tab_id}
         onSelect={(id) => void switch_tab(id)}
         onCreate={create_tab}
@@ -1091,7 +1206,7 @@
         class="flex items-center gap-2 px-3 text-sm text-destructive"
       >
         <span>{translateCommandError(notes_error)}</span>
-        <Button size="sm" variant="link" onclick={refresh_notes}
+        <Button size="sm" variant="link" onclick={() => refresh_notes()}
           >{m.note_retry()}</Button
         >
       </div>
@@ -1341,8 +1456,10 @@
           >
             {translateCommandError(notes_error)}
           </p>
-          <Button class="mx-4 mt-3" variant="outline" onclick={refresh_notes}
-            >{m.note_retry()}</Button
+          <Button
+            class="mx-4 mt-3"
+            variant="outline"
+            onclick={() => refresh_notes()}>{m.note_retry()}</Button
           >
         {:else}
           {#each available_notes as note (note.id)}<label

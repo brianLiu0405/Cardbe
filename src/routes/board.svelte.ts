@@ -25,6 +25,7 @@ import { parse_import_summary, type ImportSummary } from "./utils/import-data";
 import { addMission } from "./utils/mission.svelte";
 import type { BoardSummary } from "./board-base.svelte";
 import { TaskBoardStore } from "./board-tasks.svelte";
+import { flow_imports } from "./components/flow/import-coordinator";
 
 export type { AllTaskItem, BoardRole, BoardSummary } from "./board-base.svelte";
 
@@ -670,24 +671,41 @@ export class BoardStore extends TaskBoardStore {
 
   import_data(json_data: string): Promise<boolean> {
     const expectedBoardId = this.active_board_id;
-    const generation = this.board_generation;
+    let generation = this.board_generation;
+    let reload_archives = false;
     if (expectedBoardId === null) {
       return Promise.resolve(false);
     }
     return addMission(() =>
-      invoke<string>("import_data", { jsonData: json_data, expectedBoardId }),
+      flow_imports.replace(expectedBoardId, async () => {
+        const snapshot_path = await invoke<string>("import_data", {
+          jsonData: json_data,
+          expectedBoardId,
+        });
+        if (generation === this.board_generation) {
+          // Discard reads started against the replaced tasks before loading Flow.
+          generation = ++this.board_generation;
+          reload_archives = this.reset_archive_request();
+          // The write gate is already closed, so unmount cannot flush the old
+          // canvas. A failed read uses the existing initial-load error screen.
+          this.column_fetch_finish = false;
+          await this.get_columns();
+        }
+        return snapshot_path;
+      }),
     )
       .then((snapshot_path) => {
         if (generation !== this.board_generation) {
           return false;
         }
         this.update_labels();
-        this.get_columns();
-        if (this.archives_loaded) {
+        if (reload_archives) {
           this.get_archives();
         }
         this.get_task_templates();
-        this.can_undo = true;
+        // The backend clears task-only Undo when a portable Flow backup is
+        // restored. Omitted/null Flow retains the legacy import behavior.
+        this.can_undo = JSON.parse(json_data).flow == null;
         toast.success(m.backup_imported(), {
           id: "data-import-success",
           description: m.backup_pre_import_path({ path: snapshot_path }),

@@ -25,6 +25,7 @@ import {
 import { translateCommandError } from "#lib/command-errors.js";
 
 import { BoardStore } from "./board.svelte";
+import { flow_imports } from "./components/flow/import-coordinator";
 import { create_task } from "./type/task.svelte";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -2049,6 +2050,115 @@ describe("invitation join errors", () => {
     expect(await store.join_iroh_invite("ticket")).toBe(false);
     expect(store.iroh_last_error).toEqual(approval);
     expect(toast.error).not.toHaveBeenCalled();
+  });
+});
+
+describe("single-board import coordination", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it.each([
+    undefined,
+    null,
+    { layout: { nodes: [], viewport: null }, relationships: [] },
+  ])(
+    "offers Undo only for a legacy task-only backup (flow=%j)",
+    async (flow) => {
+      invoke_mock.mockReset();
+      vi.mocked(toast.success).mockClear();
+      invoke_mock.mockResolvedValue("isolated.pre-import.json");
+      const store = create_store();
+      store.column_fetch_finish = true;
+      store.can_undo = true;
+      vi.spyOn(store, "update_labels").mockImplementation(() => {});
+      vi.spyOn(store, "get_task_templates").mockImplementation(() => {});
+      const columns = deferred<void>();
+      vi.spyOn(store, "get_columns").mockImplementation(() => {
+        expect(flow_imports.is_blocked(7)).toBe(true);
+        expect(store.column_fetch_finish).toBe(false);
+        return columns.promise;
+      });
+      const reload = vi.fn(async () => {});
+      const unregister = flow_imports.register(7, {
+        pause() {},
+        reload,
+        resume() {},
+      });
+      const imported = store.import_data(
+        JSON.stringify({ columns: [], archives: [], flow }),
+      );
+      await vi.waitFor(() => expect(store.get_columns).toHaveBeenCalledOnce());
+      expect(reload).not.toHaveBeenCalled();
+      columns.resolve();
+      expect(await imported).toBe(true);
+      expect(reload).toHaveBeenCalledOnce();
+      expect(store.can_undo).toBe(flow == null);
+      expect(toast.success).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          id: "data-import-success",
+          action:
+            flow == null
+              ? expect.objectContaining({ onClick: expect.any(Function) })
+              : undefined,
+        }),
+      );
+      unregister();
+    },
+  );
+
+  it("keeps the error screen after a post-import column read failure", async () => {
+    invoke_mock.mockReset();
+    invoke_mock.mockImplementation((command) =>
+      command === "get_columns"
+        ? Promise.reject({ code: "INTERNAL_ERROR" })
+        : Promise.resolve("isolated.pre-import.json"),
+    );
+    const store = create_store();
+    store.column_fetch_finish = true;
+    vi.spyOn(store, "update_labels").mockImplementation(() => {});
+    vi.spyOn(store, "get_task_templates").mockImplementation(() => {});
+    expect(
+      await store.import_data(
+        '{"columns":[],"archives":[],"flow":{"layout":{"nodes":[],"viewport":null},"relationships":[]}}',
+      ),
+    ).toBe(true);
+    expect(store.column_fetch_error).toBe(true);
+    expect(store.column_fetch_finish).toBe(true);
+    expect(store.can_undo).toBe(false);
+    expect(flow_imports.is_blocked(7)).toBe(false);
+  });
+
+  it("replaces an archive request queued during import and permits subsequent fetches", async () => {
+    const pending_import = deferred<string>();
+    invoke_mock.mockReset();
+    invoke_mock.mockImplementation((command) =>
+      command === "import_data" ? pending_import.promise : Promise.resolve([]),
+    );
+    const store = create_store();
+    store.column_fetch_finish = true;
+    vi.spyOn(store, "update_labels").mockImplementation(() => {});
+    vi.spyOn(store, "get_task_templates").mockImplementation(() => {});
+    const imported = store.import_data('{"columns":[],"archives":[]}');
+    await vi.waitFor(() =>
+      expect(invoke_mock).toHaveBeenCalledWith(
+        "import_data",
+        expect.anything(),
+      ),
+    );
+    const obsolete = store.get_archives();
+    expect(store.archives_loading).toBe(true);
+    pending_import.resolve("isolated.pre-import.json");
+    expect(await imported).toBe(true);
+    await obsolete;
+    await vi.waitFor(() => expect(store.archives_loaded).toBe(true));
+    expect(store.archives_loading).toBe(false);
+    expect(
+      invoke_mock.mock.calls.filter(([command]) => command === "get_archives"),
+    ).toHaveLength(2);
+    await store.get_archives();
+    expect(
+      invoke_mock.mock.calls.filter(([command]) => command === "get_archives"),
+    ).toHaveLength(3);
   });
 });
 

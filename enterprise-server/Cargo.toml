@@ -1,0 +1,31 @@
+[package]
+name = "cardbe-enterprise-server"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Local, isolated Cardbe enterprise foundation prototype"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "net",
+  "signal",
+  "macros",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

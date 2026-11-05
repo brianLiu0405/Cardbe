@@ -2,6 +2,8 @@
 
 [Back to README](../README.md)
 
+This page describes personal desktop mode. The separate, opt-in [enterprise prototype](../enterprise-server/README.md) has its own loopback service, development credentials, and isolated database; it does not upload personal boards.
+
 ## Where your data lives
 
 Cardbe persists its application data locally in SQLite. Release builds use the system app-local-data directory. The repository does not include a sample database or personal task data.
@@ -13,6 +15,12 @@ Cardbe does not require an account, cloud sync, or an API key. It contacts the n
 - **LAN sharing** starts a local HTTP server while a share is published.
 - **Shared boards** connect to Iroh relay services for peer discovery and transport while an invitation is active. Disabling or deleting every invitation stops the owner sharing endpoint.
 - **Plugins** can reach only the HTTPS hosts you approve for each plugin instance.
+
+## Portable board backups
+
+Single-board JSON exports include the board's tasks, archives, templates, labels, Flow tabs, layouts, relationships, and annotations. They also include the full content of notes referenced by those Flow canvases; unrelated global notes are excluded. Importing into another database creates new note IDs and remaps those references instead of linking to unrelated notes with the same old ID.
+
+An overwrite import saves the previous board, Flow, and referenced notes in the pre-import recovery file. A full Flow import clears task-only Undo because that history cannot restore canvases and notes together; use the recovery file to restore the previous complete board. Legacy task-only backups remain readable.
 
 ## LAN sharing
 

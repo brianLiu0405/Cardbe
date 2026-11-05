@@ -293,7 +293,7 @@ export abstract class BoardStoreBase {
     // background missions (such as loading labels). If one of those IPC
     // calls never settles, queueing this read leaves the app on its
     // initial loading screen forever.
-    with_timeout(
+    return with_timeout(
       invoke<ColumnSerialized[]>("get_columns", { expectedBoardId }),
       COLUMN_FETCH_TIMEOUT_MS,
       "Loading board data timed out",
@@ -317,6 +317,9 @@ export abstract class BoardStoreBase {
       })
       .catch((e) => {
         logger.error("board.columns_load.failed", e);
+        if (generation !== board.board_generation) {
+          return;
+        }
         if (replaces_workspace) {
           board.column_fetch_error = true;
           board.column_fetch_finish = true;
@@ -409,6 +412,15 @@ export abstract class BoardStoreBase {
         }
       }
     }, 160);
+  }
+
+  protected reset_archive_request() {
+    const reload = this.archives_loaded || this.archives_loading;
+    this.archives = [];
+    this.archives_loaded = false;
+    this.archives_loading = false;
+    this.archives_request = undefined;
+    return reload;
   }
 
   get_archives() {

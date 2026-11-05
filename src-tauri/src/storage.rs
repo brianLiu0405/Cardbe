@@ -1,8 +1,8 @@
 use crate::errors::DomainError;
 use crate::models::{
     Archive, Board, BoardRole, Column, ColumnOverview, ColumnSort, IrohDeviceStatus,
-    IrohPermission, Note, StoredData, SyncStatus, Task, TaskSummary, TaskTemplate,
-    CURRENT_SCHEMA_VERSION,
+    IrohPermission, Note, SingleBoardExport, StoredData, SyncStatus, Task, TaskSummary,
+    TaskTemplate, CURRENT_SCHEMA_VERSION,
 };
 use crate::task_events::{self, EventSource};
 use base64::Engine;
@@ -575,6 +575,37 @@ impl Database {
 
     pub fn read_flow_backup(&self, board_id: i64) -> StorageResult<crate::flow::FlowData> {
         crate::flow::read_backup(&self.connection, board_id)
+    }
+
+    pub fn read_single_board_backup(&self, board_id: i64) -> StorageResult<SingleBoardExport> {
+        self.read_consistent(|db| -> StorageResult<_> {
+            let data = db.read_board_complete(board_id)?;
+            let flow = db.read_flow_backup(board_id)?;
+            let note_ids = flow_note_ids(&flow);
+            let notes = db
+                .get_notes()?
+                .into_iter()
+                .filter(|note| note_ids.contains(&note.id))
+                .collect();
+            Ok(SingleBoardExport {
+                data: crate::models::ExportData {
+                    labels: data
+                        .columns
+                        .iter()
+                        .flat_map(|column| &column.tasks)
+                        .flat_map(|task| task.labels.iter().cloned())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    columns: data.columns,
+                    archives: data.archives,
+                    templates: data.templates,
+                    label_recency: data.label_recency,
+                },
+                flow: Some(flow),
+                notes,
+            })
+        })?
     }
 
     pub fn save_flow_layout(
@@ -1915,10 +1946,27 @@ impl Database {
         name: &str,
         data: &StoredData,
     ) -> StorageResult<Board> {
+        self.create_board_with_backup(name, data, None, &[])
+    }
+
+    /// Board data, all Flow tabs and referenced notes commit together.
+    pub fn create_board_with_backup(
+        &mut self,
+        name: &str,
+        data: &StoredData,
+        flow: Option<&crate::flow::FlowData>,
+        notes: &[Note],
+    ) -> StorageResult<Board> {
+        if flow.is_none() && !notes.is_empty() {
+            return Err(DomainError::InvalidArgument.into());
+        }
         let tx = self.connection.transaction()?;
         tx.execute("INSERT INTO cardbe_boards(name) VALUES (?1)", [name])?;
         let id = tx.last_insert_rowid();
         write_board_transaction(&tx, id, data)?;
+        if let Some(flow) = flow {
+            restore_single_board_flow(&tx, id, flow, notes)?;
+        }
         persist_loro_local_delta(
             &tx,
             id,
@@ -2118,6 +2166,36 @@ impl Database {
         include_archives: bool,
         events: EventWrite,
     ) -> StorageResult<PersistStats> {
+        self.persist_diff_with_flow(before, after, include_archives, events, None)
+    }
+
+    pub fn import_board_data(
+        &mut self,
+        before: &StoredData,
+        after: &StoredData,
+        flow: Option<&crate::flow::FlowData>,
+        notes: &[Note],
+    ) -> StorageResult<PersistStats> {
+        if flow.is_none() && !notes.is_empty() {
+            return Err(DomainError::InvalidArgument.into());
+        }
+        self.persist_diff_with_flow(
+            before,
+            after,
+            true,
+            EventWrite::Reset(EventSource::local()),
+            flow.map(|flow| (flow, notes)),
+        )
+    }
+
+    fn persist_diff_with_flow(
+        &mut self,
+        before: &StoredData,
+        after: &StoredData,
+        include_archives: bool,
+        events: EventWrite,
+        flow: Option<(&crate::flow::FlowData, &[Note])>,
+    ) -> StorageResult<PersistStats> {
         let mut positions = self.positions.clone();
         let board_changed = before.columns != after.columns
             || before.archives != after.archives
@@ -2149,7 +2227,7 @@ impl Database {
             [self.active_board_id],
             |r| r.get(0),
         )?;
-        if board_changed && role == BoardRole::Viewer {
+        if (board_changed || flow.is_some()) && role == BoardRole::Viewer {
             return Err(DomainError::PermissionDenied.into());
         }
         let mut stats = persist_board_diff_transaction(
@@ -2160,6 +2238,17 @@ impl Database {
             &mut positions,
             include_archives,
         )?;
+        if let Some((flow, notes)) = flow {
+            transaction.execute(
+                "DELETE FROM cardbe_flow_layouts WHERE board_id=?1",
+                [self.active_board_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM cardbe_task_links WHERE board_id=?1",
+                [self.active_board_id],
+            )?;
+            restore_single_board_flow(&transaction, self.active_board_id, flow, notes)?;
+        }
         if board_changed {
             stats.event_op = match &events {
                 EventWrite::Record(source) => {
@@ -3963,7 +4052,76 @@ fn read_legacy<T: serde::de::DeserializeOwned>(
     }
 }
 
-pub fn write_document(path: &Path, data: &StoredData) -> StorageResult<()> {
+pub(crate) fn flow_note_ids(flow: &crate::flow::FlowData) -> std::collections::BTreeSet<i64> {
+    std::iter::once(&flow.layout)
+        .chain(flow.tabs.iter().filter_map(|tab| tab.layout.as_ref()))
+        .flat_map(|layout| &layout.annotations)
+        .filter_map(|annotation| match annotation.content {
+            crate::flow::AnnotationContent::Note { note_id } => Some(note_id),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(crate) fn validate_single_board_notes(
+    flow: &crate::flow::FlowData,
+    notes: &[Note],
+) -> Result<(), DomainError> {
+    let referenced = flow_note_ids(flow);
+    let mut seen = std::collections::HashSet::new();
+    if referenced.iter().any(|id| *id < 0)
+        || notes
+            .iter()
+            .any(|note| !referenced.contains(&note.id) || !seen.insert(note.id))
+    {
+        return Err(DomainError::InvalidArgument);
+    }
+    Ok(())
+}
+
+fn restore_single_board_flow(
+    tx: &Transaction<'_>,
+    board_id: i64,
+    flow: &crate::flow::FlowData,
+    notes: &[Note],
+) -> StorageResult<()> {
+    validate_single_board_notes(flow, notes)?;
+    let notes: HashMap<_, _> = notes.iter().map(|note| (note.id, note)).collect();
+    let mut ids = HashMap::new();
+    for old_id in flow_note_ids(flow) {
+        if let Some(note) = notes.get(&old_id) {
+            tx.execute(
+                "INSERT INTO notes(title,content,pinned,created_at,updated_at) VALUES(?1,?2,?3,?4,?5)",
+                params![note.title, note.content, note.pinned, note.created_at, note.updated_at],
+            )?;
+            ids.insert(old_id, tx.last_insert_rowid());
+        } else {
+            // Deleted notes can leave annotations behind. Reserve an absent ID
+            // so that the reference stays absent, even if the target database
+            // has a different note at the original ID or creates notes later.
+            tx.execute("INSERT INTO notes(created_at,updated_at) VALUES(0,0)", [])?;
+            let id = tx.last_insert_rowid();
+            tx.execute("DELETE FROM notes WHERE id=?1", [id])?;
+            ids.insert(old_id, id);
+        }
+    }
+    let mut restored = flow.clone();
+    for layout in std::iter::once(&mut restored.layout).chain(
+        restored
+            .tabs
+            .iter_mut()
+            .filter_map(|tab| tab.layout.as_mut()),
+    ) {
+        for annotation in &mut layout.annotations {
+            if let crate::flow::AnnotationContent::Note { note_id } = &mut annotation.content {
+                *note_id = ids[note_id];
+            }
+        }
+    }
+    crate::flow::restore(tx, board_id, &restored)
+}
+
+pub fn write_document(path: &Path, data: &impl serde::Serialize) -> StorageResult<()> {
     let temp_path = path.with_extension("json.tmp");
     let backup = backup_path(path);
     let result = (|| {
@@ -7912,6 +8070,204 @@ mod tests {
         assert_eq!(loaded.database.boards().unwrap().len(), 1);
         assert_eq!(loaded.database.read_board(original_id).unwrap(), original);
         assert_eq!(loaded.database.get_notes().unwrap(), vec![original_note]);
+        drop(loaded);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn single_board_fixture(
+        note_id: i64,
+        missing_note_id: i64,
+    ) -> (StoredData, crate::flow::FlowData) {
+        let mut data: StoredData = serde_json::from_value(serde_json::json!({
+            "columns": [{"id": 1, "name": "工作", "color": "", "tasks": [
+                {"id": 1, "title": "第一張卡"}, {"id": 2, "title": "第二張卡"}
+            ]}], "archives": [{"time": 123, "task": {"id": 3, "title": "已封存"}}]
+        }))
+        .unwrap();
+        data.schema_version = CURRENT_SCHEMA_VERSION;
+        data.repair_column_ids();
+        data.repair_task_ids();
+        let flow: crate::flow::FlowData = serde_json::from_value(serde_json::json!({
+            "tab_id": "first",
+            "layout": {"nodes": [{"task_id": 1, "x": 12, "y": 24, "scale": 1.5}], "viewport": {"x": 3, "y": 4, "zoom": 1.25},
+                "annotations": [{"id": "note-first", "x": 20, "y": 30, "width": 240, "kind": "note", "note_id": note_id}],
+                "connections": {"1:2": {"source_handle": "right", "target_handle": "left"}}},
+            "relationships": [{"source": 1, "target": 2, "source_arrow": true, "target_arrow": false}, {"source": 2, "target": 3, "target_arrow": true}],
+            "tabs": [
+                {"id": "first", "name": "規劃"},
+                {"id": "second", "name": "草稿", "layout": {"nodes": [{"task_id": 2, "x": -5, "y": 8}, {"task_id": 3, "x": 30, "y": 40}], "viewport": null,
+                    "annotations": [
+                        {"id": "note-second", "x": 0, "y": 0, "width": 240, "kind": "note", "note_id": note_id},
+                        {"id": "missing", "x": 0, "y": 0, "width": 240, "kind": "note", "note_id": missing_note_id},
+                        {"id": "text", "x": 1, "y": 2, "width": 300, "scale": 1.5, "kind": "text", "text": "中文備註"}
+                    ]}}
+            ]
+        })).unwrap();
+        (data, flow)
+    }
+
+    #[test]
+    fn single_board_backup_round_trips_all_tabs_and_remaps_only_referenced_notes() {
+        let dir = test_dir("single-board-flow-round-trip");
+        fs::create_dir_all(&dir).unwrap();
+        let mut loaded = load(&dir).unwrap();
+        let note = loaded
+            .database
+            .create_note_with_content(123, "說明".into(), "完整內容".into())
+            .unwrap();
+        let unrelated = loaded
+            .database
+            .create_note_with_content(456, "私人便箋".into(), "不應匯出".into())
+            .unwrap();
+        let (data, flow) = single_board_fixture(note.id, unrelated.id);
+        let source = loaded
+            .database
+            .create_board_with_data("Source", &data)
+            .unwrap();
+        let tx = loaded.database.connection.transaction().unwrap();
+        crate::flow::restore(&tx, source.id, &flow).unwrap();
+        tx.commit().unwrap();
+        loaded.database.delete_note(unrelated.id).unwrap();
+        let private_note = loaded
+            .database
+            .create_note_with_content(789, "Unrelated".into(), "Private".into())
+            .unwrap();
+        let backup = loaded.database.read_single_board_backup(source.id).unwrap();
+        assert_eq!(backup.notes, vec![note.clone()]);
+        let flow = backup.flow.unwrap();
+        assert!(flow.tabs.iter().all(|tab| tab.layout.is_some()));
+        let imported = loaded
+            .database
+            .create_board_with_backup("Imported", &data, Some(&flow), &backup.notes)
+            .unwrap();
+        let actual = loaded.database.read_flow_backup(imported.id).unwrap();
+        let imported_notes = loaded.database.get_notes().unwrap();
+        assert_eq!(imported_notes.len(), 3);
+        assert!(imported_notes.contains(&private_note));
+        let copied = imported_notes
+            .iter()
+            .find(|item| item.id != note.id && item.title == note.title)
+            .unwrap();
+        assert_eq!(copied.content, note.content);
+        assert_eq!(copied.created_at, note.created_at);
+        let missing = flow_note_ids(&actual)
+            .into_iter()
+            .find(|id| *id != copied.id)
+            .unwrap();
+        assert!(!imported_notes.iter().any(|item| item.id == missing));
+        assert_ne!(missing, unrelated.id);
+        let mut expected = flow.clone();
+        for layout in std::iter::once(&mut expected.layout).chain(
+            expected
+                .tabs
+                .iter_mut()
+                .filter_map(|tab| tab.layout.as_mut()),
+        ) {
+            for annotation in &mut layout.annotations {
+                if let crate::flow::AnnotationContent::Note { note_id } = &mut annotation.content {
+                    *note_id = if *note_id == note.id {
+                        copied.id
+                    } else {
+                        missing
+                    };
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(loaded.database.read_flow_backup(source.id).unwrap(), flow);
+        let future = loaded.database.create_note(999).unwrap();
+        assert!(future.id > missing);
+        drop(loaded);
+        let reopened = load(&dir).unwrap();
+        assert_eq!(
+            reopened.database.read_flow_backup(imported.id).unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened
+                .database
+                .read_board_complete(imported.id)
+                .unwrap()
+                .columns,
+            data.columns
+        );
+        drop(reopened);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn single_board_import_failure_rolls_back_board_flow_notes_and_sync_state() {
+        let dir = test_dir("single-board-flow-rollback");
+        fs::create_dir_all(&dir).unwrap();
+        let mut loaded = load(&dir).unwrap();
+        let active = loaded.database.active_board_id();
+        let before = loaded.database.read_board_complete(active).unwrap();
+        let before_flow = loaded.database.read_flow_backup(active).unwrap();
+        let before_sync = loaded.database.board_sync_state(active).unwrap();
+        let note = Note {
+            id: 5,
+            title: "Imported".into(),
+            content: "Content".into(),
+            pinned: true,
+            created_at: 1,
+            updated_at: 2,
+        };
+        let (data, flow) = single_board_fixture(note.id, 6);
+        // Fail after task and note writes, when restoring the second canvas.
+        loaded.database.connection.execute_batch("CREATE TRIGGER fail_flow_import BEFORE INSERT ON cardbe_flow_layouts WHEN NEW.layout_id='second' BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+        assert!(loaded
+            .database
+            .create_board_with_backup(
+                "Must roll back",
+                &data,
+                Some(&flow),
+                std::slice::from_ref(&note)
+            )
+            .is_err());
+        assert_eq!(loaded.database.boards().unwrap().len(), 1);
+        assert!(loaded.database.get_notes().unwrap().is_empty());
+        assert!(loaded
+            .database
+            .import_board_data(&before, &data, Some(&flow), &[note])
+            .is_err());
+        assert_eq!(loaded.database.read_board_complete(active).unwrap(), before);
+        assert_eq!(
+            loaded.database.read_flow_backup(active).unwrap(),
+            before_flow
+        );
+        assert_eq!(
+            loaded.database.board_sync_state(active).unwrap(),
+            before_sync
+        );
+        assert!(loaded.database.get_notes().unwrap().is_empty());
+        loaded
+            .database
+            .connection
+            .execute_batch("DROP TRIGGER fail_flow_import;")
+            .unwrap();
+        // A failed transaction must also leave the in-memory position cache usable.
+        loaded
+            .database
+            .import_board_data(&before, &data, Some(&flow), &[])
+            .unwrap();
+        assert_eq!(
+            loaded.database.read_board_complete(active).unwrap().columns,
+            data.columns
+        );
+        loaded
+            .database
+            .set_shared_board(active, BoardRole::Viewer, SyncStatus::Synced, 1)
+            .unwrap();
+        let current = loaded.database.read_board_complete(active).unwrap();
+        assert!(loaded
+            .database
+            .import_board_data(
+                &current,
+                &current,
+                Some(&crate::flow::FlowData::default()),
+                &[]
+            )
+            .is_err());
         drop(loaded);
         fs::remove_dir_all(dir).unwrap();
     }

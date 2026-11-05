@@ -982,6 +982,19 @@ pub struct ExportData {
     pub label_recency: Vec<String>,
 }
 
+/// Portable single-board backup. The flattened task fields remain compatible
+/// with older backups and import previews; sharing still uses `ExportData`.
+#[derive(Serialize, Deserialize)]
+pub struct SingleBoardExport {
+    #[serde(flatten)]
+    pub data: ExportData,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<crate::flow::FlowData>,
+    /// Only notes referenced by this board's Flow canvases, using backup IDs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
+}
+
 /// Complete, portable backup. Unlike `ExportData`, this contains every board
 /// plus global data and is deliberately versioned for future migrations.
 #[derive(Serialize, Deserialize)]
